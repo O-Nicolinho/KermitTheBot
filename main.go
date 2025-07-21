@@ -103,76 +103,106 @@ func mustEnv(k string) string {
 func onSlash(db *pgx.Conn, sched *cron.Cron) func(*discordgo.Session, *discordgo.InteractionCreate) {
 	return func(s *discordgo.Session, ic *discordgo.InteractionCreate) {
 		if ic.Type != discordgo.InteractionApplicationCommand {
-			return
+			return // only care about slash/interactions
 		}
 
-		name := ic.ApplicationCommandData().Name
+		switch ic.ApplicationCommandData().Name {
 
-		switch name {
-
-		case "remind": // eg: remind 09:00 America/Toronto water your plants
-
-			args := strings.SplitN(ic.ApplicationCommandData().Options[0].StringValue(), " ", 3)
-
-			if len(args) < 3 {
-				respond(s, ic, "Invalid input: correct usage is /remind HH:MM Timezone Mesage")
+		// ─────────────────────────  /remind  ──────────────────────────
+		case "remind":
+			// pull the 3 option values
+			var (
+				timeStr string
+				tzStr   string
+				msgStr  string
+			)
+			for _, opt := range ic.ApplicationCommandData().Options {
+				switch opt.Name {
+				case "time":
+					timeStr = opt.StringValue() // "06:35"
+				case "timezone":
+					tzStr = opt.StringValue() // "America/Toronto"
+				case "message":
+					msgStr = opt.StringValue() // "uwu"
+				}
+			}
+			if timeStr == "" || tzStr == "" || msgStr == "" {
+				respond(s, ic, "All three options (time, timezone, message) are required.")
 				return
 			}
 
-			tkn := strings.Split(args[0], ":")
-			if len(tkn) != 2 {
-				respond(s, ic, "Correct time format is HH:MM.")
+			// validate HH:MM
+			parts := strings.Split(timeStr, ":")
+			if len(parts) != 2 {
+				respond(s, ic, "Time must be HH:MM (24‑hour).")
+				return
+			}
+			hour, min := atoi(parts[0]), atoi(parts[1])
+			if hour < 0 || hour > 23 || min < 0 || min > 59 {
+				respond(s, ic, "Time must be a valid 24‑hour clock value.")
 				return
 			}
 
-			hour, min := atoi(tkn[0]), atoi(tkn[1])
-
-			loc, err := time.LoadLocation(args[1])
-
+			// validate timezone
+			loc, err := time.LoadLocation(tzStr)
 			if err != nil {
-				respond(s, ic, "Invalid timezone")
+				respond(s, ic, "Invalid timezone name.")
 				return
-
 			}
 
-			msg := args[2]
-
+			// insert into Postgres
 			row := Reminder{
 				UserID:    ic.Member.User.ID,
 				ChannelID: ic.ChannelID,
-				Message:   msg,
+				Message:   msgStr,
 				Hour:      hour,
 				Min:       min,
-				TZ:        args[1],
+				TZ:        tzStr,
 				Active:    true,
 			}
 
-			err = db.QueryRow(context.Background(),
-				`INSERT INTO reminders(user_id, channel_id, message, hour, minute, tz, active)
-			 VALUES($1,$2,$3,$4,$5,$6,true)
-			 RETURNING ID`,
+			err = db.QueryRow(
+				context.Background(),
+				`INSERT INTO reminders(user_id,channel_id,message,hour,minute,tz,active)
+				 VALUES ($1,$2,$3,$4,$5,$6,true)
+				 RETURNING id`,
 				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ,
 			).Scan(&row.ID)
-
 			if err != nil {
-				respond(s, ic, "db error")
+				respond(s, ic, "Database error while saving your reminder.")
 				return
 			}
 
+			// schedule the daily reminder
 			row.CronID = scheduleOne(sched, row, s, loc)
 
-			respond(s, ic, fmt.Sprintf("Reminder Set! I will remind you daily at %02d:%02d %s", hour, min, args[1]))
+			respond(
+				s, ic,
+				fmt.Sprintf("Got it! I’ll remind you every day at %02d:%02d %s (ID %d)",
+					hour, min, tzStr, row.ID),
+			)
 
+		// ───────────────────────────  /stop  ──────────────────────────
 		case "stop":
-			id := ic.ApplicationCommandData().Options[0].IntValue()
-			_, err := db.Exec(context.Background(), "UPDATE reminders SET active=false WHERE id=$1", id)
-			if err != nil {
-				respond(s, ic, "db error")
+
+			if len(ic.ApplicationCommandData().Options) == 0 {
+				respond(s, ic, "Usage: /stop <reminder‑ID>")
 				return
 			}
-			respond(s, ic, "Reminder stopped successfully!")
-		}
+			id := ic.ApplicationCommandData().Options[0].IntValue()
 
+			/* mark inactive in DB */
+			if _, err := db.Exec(
+				context.Background(),
+				`UPDATE reminders SET active=false WHERE id=$1`,
+				id,
+			); err != nil {
+				respond(s, ic, "Database error while stopping reminder.")
+				return
+			}
+
+			respond(s, ic, fmt.Sprintf("Reminder %d stopped ✅", id))
+		}
 	}
 }
 
