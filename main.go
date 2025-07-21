@@ -231,11 +231,20 @@ func restoreJobs(db *pgx.Conn, c *cron.Cron) {
 	}
 }
 
-func scheduleOne(c *cron.Cron, r Reminder, s *discordgo.Session, loc *time.Location) cron.EntryID {
-	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour) // m h dom mon dow
+func scheduleOne(_ *cron.Cron, r Reminder, s *discordgo.Session, loc *time.Location) cron.EntryID {
+	c := cron.New(cron.WithLocation(loc))
+
+	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour)
+
 	id, _ := c.AddFunc(spec, func() {
-		s.ChannelMessageSend(r.ChannelID, "<@"+r.UserID+"> "+r.Message)
+
+		if s != nil {
+			s.ChannelMessageSend(r.ChannelID, "<@"+r.UserID+"> "+r.Message)
+		}
 	})
+
+	c.Start()
+
 	return id
 }
 
