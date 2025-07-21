@@ -72,6 +72,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ensureCommands(dg)
+
 	defer dg.Close()
 
 	// ======= Web Server ========
@@ -210,6 +212,29 @@ func scheduleOne(c *cron.Cron, r Reminder, s *discordgo.Session, loc *time.Locat
 func atoi(s string) int {
 	i, _ := strconv.Atoi(s)
 	return i
+}
+
+func ensureCommands(dg *discordgo.Session) {
+	appID := dg.State.User.ID
+	cmds, _ := dg.ApplicationCommands(appID, "")
+	if len(cmds) > 0 {
+		return
+	} // already registered
+
+	_, _ = dg.ApplicationCommandCreate(appID, "", &discordgo.ApplicationCommand{
+		Name: "remind", Description: "Create a daily reminder",
+		Options: []*discordgo.ApplicationCommandOption{
+			{Type: discordgo.ApplicationCommandOptionString, Name: "time", Description: "HH:MM", Required: true},
+			{Type: discordgo.ApplicationCommandOptionString, Name: "timezone", Description: "TZ name", Required: true},
+			{Type: discordgo.ApplicationCommandOptionString, Name: "message", Description: "Text", Required: true},
+		},
+	})
+	_, _ = dg.ApplicationCommandCreate(appID, "", &discordgo.ApplicationCommand{
+		Name: "stop", Description: "Cancel a reminder",
+		Options: []*discordgo.ApplicationCommandOption{
+			{Type: discordgo.ApplicationCommandOptionInteger, Name: "id", Description: "Reminder ID", Required: true},
+		},
+	})
 }
 
 const schema = `
