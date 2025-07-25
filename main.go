@@ -294,6 +294,6 @@ CREATE TABLE IF NOT EXISTS reminders (
 	hour        INT,
 	minute      INT,
 	tz          TEXT,
-	active      BOOLEAN DEFAULT TRUE
+	active      BOOLEAN DEFAULT TRUE,
 	CONSTRAINT uniq_user_time UNIQUE (user_id, hour, minute, tz, message)
 );`
