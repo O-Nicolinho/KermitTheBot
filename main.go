@@ -56,7 +56,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dg.AddHandler(onSlash(db)) // handler no longer needs sched
+	dg.AddHandler(onSlash(db))
 	if err := dg.Open(); err != nil {
 		log.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func onSlash(db *pgx.Conn) func(*discordgo.Session, *discordgo.InteractionCreate
 			VALUES ($1,$2,$3,$4,$5,$6,true)
 			ON CONFLICT ON CONSTRAINT uniq_user_time
 			DO UPDATE SET active=true,
-						channel_id = EXCLUDED.channel_id        -- user might run /remind in a new channel
+						channel_id = EXCLUDED.channel_id
 			RETURNING id`,
 				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ,
 			).Scan(&row.ID)
@@ -229,6 +229,10 @@ func restoreJobs(db *pgx.Conn, ses *discordgo.Session) {
 
 func scheduleOne(db *pgx.Conn, r Reminder, s *discordgo.Session, loc *time.Location) {
 
+	if s == nil {
+		return
+	}
+
 	if old, ok := crons[r.ID]; ok {
 		old.Stop()
 	}
@@ -291,4 +295,5 @@ CREATE TABLE IF NOT EXISTS reminders (
 	minute      INT,
 	tz          TEXT,
 	active      BOOLEAN DEFAULT TRUE
+	CONSTRAINT uniq_user_time UNIQUE (user_id, hour, minute, tz, message)
 );`
