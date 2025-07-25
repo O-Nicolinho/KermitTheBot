@@ -16,6 +16,10 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+var crons = make(map[int]*cron.Cron)
+
+var sched = cron.New()
+
 type Reminder struct {
 	ID        int
 	UserID    string
@@ -29,65 +33,57 @@ type Reminder struct {
 }
 
 func main() {
-
+	/* ─── env vars ────────────────────────────────────────────── */
 	token := mustEnv("DISCORD_TOKEN")
-
 	dsn := mustEnv("DATABASE_URL")
-
 	port := os.Getenv("PORT")
-
 	if port == "" {
 		port = "8080"
 	}
 
-	// ======= Postgres ========
-
+	/* ─── Postgres ────────────────────────────────────────────── */
 	db, err := pgx.Connect(context.Background(), dsn)
-
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close(context.Background())
 
-	// ========        =========
 	if _, err := db.Exec(context.Background(), schema); err != nil {
 		log.Fatal(err)
 	}
 
-	// ======= Scheduler ========
-
-	sched := cron.New()
-
-	restoreJobs(db, sched)
-	sched.Start()
-
-	defer sched.Stop()
-
-	// ======= Discord ========
-
-	dg, _ := discordgo.New("Bot " + token)
-	dg.AddHandler(onSlash(db, sched))
-
-	if err := dg.Open(); err != nil {
+	/* ─── Discord session ─────────────────────────────────────── */
+	dg, err := discordgo.New("Bot " + token)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	ensureCommands(dg)
-
+	dg.AddHandler(onSlash(db)) // handler no longer needs sched
+	if err := dg.Open(); err != nil {
+		log.Fatal(err)
+	}
 	defer dg.Close()
 
-	// ======= Web Server ========
+	ensureCommands(dg) // register /remind and /stop (once)
 
+	/* ─── scheduler & job restore ─────────────────────────────── */
+	sched.Start()
+	defer sched.Stop()
+
+	restoreJobs(db, dg) // rebuild jobs in memory using live session
+
+	/* ─── tiny health HTTP server (keeps Render awake) ────────── */
 	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("ok"))
+		})
 		log.Fatal(http.ListenAndServe(":"+port, nil))
 	}()
 
+	/* ─── graceful shutdown ───────────────────────────────────── */
 	stop := make(chan os.Signal, 1)
-
 	signal.Notify(stop, os.Interrupt)
 	<-stop
-
 }
 
 // ======= Helpers ========
@@ -100,22 +96,19 @@ func mustEnv(k string) string {
 	return v
 }
 
-func onSlash(db *pgx.Conn, sched *cron.Cron) func(*discordgo.Session, *discordgo.InteractionCreate) {
+func onSlash(db *pgx.Conn) func(*discordgo.Session, *discordgo.InteractionCreate) {
 	return func(s *discordgo.Session, ic *discordgo.InteractionCreate) {
+		// we only want slash commands
 		if ic.Type != discordgo.InteractionApplicationCommand {
-			return // only care about slash/interactions
+			return
 		}
 
 		switch ic.ApplicationCommandData().Name {
 
-		// ─────────────────────────  /remind  ──────────────────────────
+		/* ───────────────  /remind  ─────────────── */
 		case "remind":
-			// pull the 3 option values
-			var (
-				timeStr string
-				tzStr   string
-				msgStr  string
-			)
+			// gather option values
+			var timeStr, tzStr, msgStr string
 			for _, opt := range ic.ApplicationCommandData().Options {
 				switch opt.Name {
 				case "time":
@@ -131,7 +124,7 @@ func onSlash(db *pgx.Conn, sched *cron.Cron) func(*discordgo.Session, *discordgo
 				return
 			}
 
-			// validate HH:MM
+			// HH:MM validation
 			parts := strings.Split(timeStr, ":")
 			if len(parts) != 2 {
 				respond(s, ic, "Time must be HH:MM (24‑hour).")
@@ -143,14 +136,14 @@ func onSlash(db *pgx.Conn, sched *cron.Cron) func(*discordgo.Session, *discordgo
 				return
 			}
 
-			// validate timezone
+			// timezone validation
 			loc, err := time.LoadLocation(tzStr)
 			if err != nil {
 				respond(s, ic, "Invalid timezone name.")
 				return
 			}
 
-			// insert into Postgres
+			// save to DB
 			row := Reminder{
 				UserID:    ic.Member.User.ID,
 				ChannelID: ic.ChannelID,
@@ -160,45 +153,43 @@ func onSlash(db *pgx.Conn, sched *cron.Cron) func(*discordgo.Session, *discordgo
 				TZ:        tzStr,
 				Active:    true,
 			}
-
-			err = db.QueryRow(
-				context.Background(),
-				`INSERT INTO reminders(user_id,channel_id,message,hour,minute,tz,active)
+			err = db.QueryRow(context.Background(),
+				`INSERT INTO reminders
+				 (user_id,channel_id,message,hour,minute,tz,active)
 				 VALUES ($1,$2,$3,$4,$5,$6,true)
 				 RETURNING id`,
-				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ,
-			).Scan(&row.ID)
+				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ).
+				Scan(&row.ID)
 			if err != nil {
 				respond(s, ic, "Database error while saving your reminder.")
 				return
 			}
 
-			// schedule the daily reminder
-			row.CronID = scheduleOne(sched, row, s, loc)
+			// schedule the cron job
+			scheduleOne(db, row, s, loc)
 
-			respond(
-				s, ic,
-				fmt.Sprintf("Got it! I’ll remind you every day at %02d:%02d %s (ID %d)",
-					hour, min, tzStr, row.ID),
-			)
+			respond(s, ic,
+				fmt.Sprintf("Got it! I’ll remind you every day at %02d:%02d %s (ID %d)",
+					hour, min, tzStr, row.ID))
 
-		// ───────────────────────────  /stop  ──────────────────────────
 		case "stop":
-
 			if len(ic.ApplicationCommandData().Options) == 0 {
 				respond(s, ic, "Usage: /stop <reminder‑ID>")
 				return
 			}
-			id := ic.ApplicationCommandData().Options[0].IntValue()
+			id := int(ic.ApplicationCommandData().Options[0].IntValue())
 
-			/* mark inactive in DB */
-			if _, err := db.Exec(
-				context.Background(),
-				`UPDATE reminders SET active=false WHERE id=$1`,
-				id,
-			); err != nil {
+			// mark inactive in DB
+			if _, err := db.Exec(context.Background(),
+				`UPDATE reminders SET active=false WHERE id=$1`, id); err != nil {
 				respond(s, ic, "Database error while stopping reminder.")
 				return
+			}
+
+			// cancel the cron runner if it exists
+			if c, ok := crons[id]; ok {
+				c.Stop()
+				delete(crons, id)
 			}
 
 			respond(s, ic, fmt.Sprintf("Reminder %d stopped ✅", id))
@@ -213,39 +204,47 @@ func respond(s *discordgo.Session, ic *discordgo.InteractionCreate, msg string) 
 	})
 }
 
-func restoreJobs(db *pgx.Conn, c *cron.Cron) {
+func restoreJobs(db *pgx.Conn, ses *discordgo.Session) {
 	rows, _ := db.Query(context.Background(),
-		`SELECT id,user_id,channel_id,message,hour,minute,tz FROM reminders WHERE active`)
+		`SELECT id,user_id,channel_id,message,hour,minute,tz
+		   FROM reminders
+		  WHERE active`)
 	defer rows.Close()
 
 	for rows.Next() {
 		var r Reminder
-		if err := rows.Scan(&r.ID, &r.UserID, &r.ChannelID, &r.Message, &r.Hour, &r.Min, &r.TZ); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.ChannelID,
+			&r.Message, &r.Hour, &r.Min, &r.TZ); err != nil {
 			continue
 		}
 		loc, err := time.LoadLocation(r.TZ)
 		if err != nil {
 			continue
 		}
-		scheduleOne(c, r, nil, loc) // Discord session is nil because we can't send messages during cold start
+
+		scheduleOne(db, r, ses, loc)
 	}
 }
 
-func scheduleOne(_ *cron.Cron, r Reminder, s *discordgo.Session, loc *time.Location) cron.EntryID {
+func scheduleOne(db *pgx.Conn, r Reminder, s *discordgo.Session, loc *time.Location) {
+	// per‑reminder cron in the user’s TZ
 	c := cron.New(cron.WithLocation(loc))
 
-	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour)
+	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour) // minute hour dom mon dow
 
-	id, _ := c.AddFunc(spec, func() {
-
-		if s != nil {
-			s.ChannelMessageSend(r.ChannelID, "<@"+r.UserID+"> "+r.Message)
+	_, _ = c.AddFunc(spec, func() {
+		var active bool
+		_ = db.QueryRow(context.Background(),
+			"SELECT active FROM reminders WHERE id=$1", r.ID).Scan(&active)
+		if !active {
+			return
 		}
+
+		s.ChannelMessageSend(r.ChannelID, "<@"+r.UserID+"> "+r.Message)
 	})
 
 	c.Start()
-
-	return id
+	crons[r.ID] = c
 }
 
 func atoi(s string) int {
