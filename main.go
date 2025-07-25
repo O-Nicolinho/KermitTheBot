@@ -18,8 +18,6 @@ import (
 
 var crons = make(map[int]*cron.Cron)
 
-var sched = cron.New()
-
 type Reminder struct {
 	ID        int
 	UserID    string
@@ -33,7 +31,7 @@ type Reminder struct {
 }
 
 func main() {
-	/* ─── env vars ────────────────────────────────────────────── */
+	// =========== ENV ===============
 	token := mustEnv("DISCORD_TOKEN")
 	dsn := mustEnv("DATABASE_URL")
 	port := os.Getenv("PORT")
@@ -41,7 +39,7 @@ func main() {
 		port = "8080"
 	}
 
-	/* ─── Postgres ────────────────────────────────────────────── */
+	// =========== PostGres ===============
 	db, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {
 		log.Fatal(err)
@@ -52,7 +50,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	/* ─── Discord session ─────────────────────────────────────── */
+	// =========== Discord ===============
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
 		log.Fatal(err)
@@ -66,13 +64,11 @@ func main() {
 
 	ensureCommands(dg) // register /remind and /stop (once)
 
-	/* ─── scheduler & job restore ─────────────────────────────── */
-	sched.Start()
-	defer sched.Stop()
+	// job restore
 
 	restoreJobs(db, dg) // rebuild jobs in memory using live session
 
-	/* ─── tiny health HTTP server (keeps Render awake) ────────── */
+	// keeps render awake
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("ok"))
@@ -80,7 +76,7 @@ func main() {
 		log.Fatal(http.ListenAndServe(":"+port, nil))
 	}()
 
-	/* ─── graceful shutdown ───────────────────────────────────── */
+	// shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	<-stop
@@ -105,9 +101,9 @@ func onSlash(db *pgx.Conn) func(*discordgo.Session, *discordgo.InteractionCreate
 
 		switch ic.ApplicationCommandData().Name {
 
-		/* ───────────────  /remind  ─────────────── */
+		// =========== Remind ===============
 		case "remind":
-			// gather option values
+
 			var timeStr, tzStr, msgStr string
 			for _, opt := range ic.ApplicationCommandData().Options {
 				switch opt.Name {
@@ -143,7 +139,7 @@ func onSlash(db *pgx.Conn) func(*discordgo.Session, *discordgo.InteractionCreate
 				return
 			}
 
-			// save to DB
+			// save to Database
 			row := Reminder{
 				UserID:    ic.Member.User.ID,
 				ChannelID: ic.ChannelID,
@@ -153,13 +149,18 @@ func onSlash(db *pgx.Conn) func(*discordgo.Session, *discordgo.InteractionCreate
 				TZ:        tzStr,
 				Active:    true,
 			}
+
 			err = db.QueryRow(context.Background(),
 				`INSERT INTO reminders
-				 (user_id,channel_id,message,hour,minute,tz,active)
-				 VALUES ($1,$2,$3,$4,$5,$6,true)
-				 RETURNING id`,
-				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ).
-				Scan(&row.ID)
+			(user_id,channel_id,message,hour,minute,tz,active)
+			VALUES ($1,$2,$3,$4,$5,$6,true)
+			ON CONFLICT ON CONSTRAINT uniq_user_time
+			DO UPDATE SET active=true,
+						channel_id = EXCLUDED.channel_id        -- user might run /remind in a new channel
+			RETURNING id`,
+				row.UserID, row.ChannelID, row.Message, row.Hour, row.Min, row.TZ,
+			).Scan(&row.ID)
+
 			if err != nil {
 				respond(s, ic, "Database error while saving your reminder.")
 				return
@@ -227,10 +228,14 @@ func restoreJobs(db *pgx.Conn, ses *discordgo.Session) {
 }
 
 func scheduleOne(db *pgx.Conn, r Reminder, s *discordgo.Session, loc *time.Location) {
-	// per‑reminder cron in the user’s TZ
+
+	if old, ok := crons[r.ID]; ok {
+		old.Stop()
+	}
+
 	c := cron.New(cron.WithLocation(loc))
 
-	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour) // minute hour dom mon dow
+	spec := fmt.Sprintf("%d %d * * *", r.Min, r.Hour)
 
 	_, _ = c.AddFunc(spec, func() {
 		var active bool
@@ -244,6 +249,7 @@ func scheduleOne(db *pgx.Conn, r Reminder, s *discordgo.Session, loc *time.Locat
 	})
 
 	c.Start()
+
 	crons[r.ID] = c
 }
 
